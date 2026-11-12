@@ -1,0 +1,590 @@
+#!/usr/bin/env node
+/**
+ * kie.ai Agent Plugin MCP server (stdio, zero dependencies, Node >= 18).
+ * Never logs secrets. Does not invent API fields.
+ */
+
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
+
+const API_BASE = "https://api.kie.ai";
+const UPLOAD_BASE = "https://kieai.redpandaai.co";
+const PROTOCOL_VERSION = "2024-11-05";
+const SERVER_INFO = { name: "kie-ai", version: "0.1.0" };
+
+const CODE_MESSAGES = {
+  401: "Unauthorized: API key is missing or invalid. Set KIE_API_KEY and use Authorization: Bearer <key>.",
+  402: "Insufficient credits: the account balance is too low for this request.",
+  404: "Not found: the requested resource or endpoint does not exist.",
+  422: "Invalid parameters: the request failed validation, or the taskId is missing, unknown, or not owned by this account.",
+  429: "Rate limited: too many requests. Back off and retry; Market task polling should stay around 2–5 seconds.",
+  433: "Sub-key limit exceeded.",
+  455: "Service unavailable: kie.ai is under maintenance.",
+  500: "Server error: kie.ai could not process the request. Retry later.",
+  501: "Generation failed. See failMsg or the API message for details.",
+  505: "Feature disabled: this capability is currently turned off.",
+};
+
+const TOOLS = [
+  {
+    name: "kie_create_task",
+    description:
+      "Create a kie.ai Market generation task (image, video, or music). POST /api/v1/jobs/createTask. Returns { taskId }. This call spends credits. Always get the user's explicit OK before any video generation.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["model", "input"],
+      properties: {
+        model: {
+          type: "string",
+          description:
+            "Market model id, e.g. gpt-image-2-6/flare-text-to-image, kling-3.0/video, veo-3-1, ai-music-api/generate.",
+        },
+        input: {
+          type: "object",
+          description: "Model-specific input object (prompt, aspect_ratio, input_urls, etc.). Passed through as-is.",
+          additionalProperties: true,
+        },
+        callBackUrl: {
+          type: "string",
+          description: "Optional webhook URL. kie.ai POSTs the final task status here when the job finishes.",
+        },
+      },
+    },
+  },
+  {
+    name: "kie_get_task",
+    description:
+      "Fetch one Market task and return a normalized KieTask (taskId, model, state, resultUrls, failMsg, costTime, createTime). GET /api/v1/jobs/recordInfo?taskId=",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["taskId"],
+      properties: {
+        taskId: {
+          type: "string",
+          description: "Task id returned by kie_create_task / createTask.",
+        },
+      },
+    },
+  },
+  {
+    name: "kie_wait_task",
+    description:
+      "Poll kie_get_task with 2–5s exponential backoff until state is success or fail, or until timeoutSec. Video jobs can take more than 10 minutes. Does not create a new task.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["taskId"],
+      properties: {
+        taskId: {
+          type: "string",
+          description: "Task id to poll.",
+        },
+        timeoutSec: {
+          type: "number",
+          description: "Maximum seconds to wait. Default 600 (10 minutes). Use a larger value for long video jobs.",
+        },
+      },
+    },
+  },
+  {
+    name: "kie_get_credits",
+    description:
+      "Read the account credit balance. GET /api/v1/chat/credit. Read-only and does not spend credits.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+    },
+  },
+  {
+    name: "kie_upload_file",
+    description:
+      "Upload a local file, remote URL, or base64 payload to kie.ai file storage and return a public downloadUrl for input_urls / image_urls. Files are free to upload and are deleted after 24 hours. Base URL: https://kieai.redpandaai.co",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        path: {
+          type: "string",
+          description: "Local file path. Uploaded as multipart to POST /api/file-stream-upload.",
+        },
+        fileUrl: {
+          type: "string",
+          description: "Public source URL. Uploaded via POST /api/file-url-upload.",
+        },
+        base64Data: {
+          type: "string",
+          description:
+            "Base64 payload, preferably a data URL (data:<mime>;base64,...). Uploaded via POST /api/file-base64-upload.",
+        },
+        uploadPath: {
+          type: "string",
+          description: "Storage path without leading or trailing slashes. Required by the API. Defaults to images.",
+        },
+        fileName: {
+          type: "string",
+          description: "Optional file name with extension. Omitted names are generated by kie.ai.",
+        },
+      },
+    },
+  },
+];
+
+function getApiKey() {
+  const key = process.env.KIE_API_KEY;
+  return typeof key === "string" ? key.trim() : "";
+}
+
+function explainCode(code, fallbackMsg) {
+  const mapped = CODE_MESSAGES[code];
+  const detail = typeof fallbackMsg === "string" && fallbackMsg.trim() ? fallbackMsg.trim() : "";
+  if (mapped && detail && detail.toLowerCase() !== "success") {
+    return `${mapped} (${code}: ${detail})`;
+  }
+  if (mapped) return `${mapped} (${code})`;
+  if (detail) return `kie.ai error ${code}: ${detail}`;
+  return `kie.ai error ${code}`;
+}
+
+function jsonResult(payload, isError = false) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+    isError,
+  };
+}
+
+function errorResult(code, msg, extra = {}) {
+  return jsonResult(
+    {
+      ok: false,
+      code,
+      error: explainCode(code, msg),
+      msg: msg ?? null,
+      ...extra,
+    },
+    true,
+  );
+}
+
+function addUrl(urls, seen, value) {
+  if (typeof value !== "string") return;
+  const url = value.trim();
+  if (!/^https?:\/\//i.test(url) || seen.has(url)) return;
+  seen.add(url);
+  urls.push(url);
+}
+
+function tryParseJson(value) {
+  if (value == null || value === "") return null;
+  if (typeof value === "object") return value;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function collectUrlsFromResult(parsed, urls, seen) {
+  if (!parsed || typeof parsed !== "object") return;
+  if (Array.isArray(parsed.resultUrls)) {
+    for (const item of parsed.resultUrls) addUrl(urls, seen, item);
+  }
+  addUrl(urls, seen, parsed.lastFrameUrl);
+  const list = Array.isArray(parsed.data) ? parsed.data : null;
+  if (list) {
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      // Suno audio tasks: data.response.data[] per official generate-music docs.
+      addUrl(urls, seen, item.audio_url);
+      addUrl(urls, seen, item.stream_audio_url);
+      addUrl(urls, seen, item.image_url);
+      addUrl(urls, seen, item.video_url);
+    }
+  }
+}
+
+function normalizeTask(data) {
+  const parsedResult = tryParseJson(data?.resultJson);
+  const response = data?.response && typeof data.response === "object" ? data.response : parsedResult;
+  const urls = [];
+  const seen = new Set();
+  collectUrlsFromResult(parsedResult, urls, seen);
+  collectUrlsFromResult(response, urls, seen);
+
+  const failMsg =
+    typeof data?.failMsg === "string" && data.failMsg.trim() ? data.failMsg.trim() : null;
+  const failCode =
+    typeof data?.failCode === "string" && data.failCode.trim() ? data.failCode.trim() : null;
+
+  const task = {
+    taskId: data?.taskId ?? null,
+    model: data?.model ?? null,
+    state: data?.state ?? null,
+    resultUrls: urls,
+    failMsg,
+    costTime: data?.costTime ?? null,
+    createTime: data?.createTime ?? null,
+  };
+  if (failCode) task.failCode = failCode;
+  if (data?.completeTime != null) task.completeTime = data.completeTime;
+  if (data?.creditsConsumed != null) task.creditsConsumed = data.creditsConsumed;
+  if (data?.progress != null) task.progress = data.progress;
+  return task;
+}
+
+async function kieRequest(method, url, { headers = {}, body = undefined } = {}) {
+  const key = getApiKey();
+  if (!key) {
+    return {
+      transportError: false,
+      status: 0,
+      payload: { code: 401, msg: "KIE_API_KEY is not set" },
+    };
+  }
+
+  const requestHeaders = { Authorization: `Bearer ${key}`, ...headers };
+  let response;
+  try {
+    response = await fetch(url, { method, headers: requestHeaders, body });
+  } catch (err) {
+    return {
+      transportError: true,
+      status: 0,
+      payload: { code: 500, msg: err instanceof Error ? err.message : "Network request failed" },
+    };
+  }
+
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { code: response.ok ? 500 : response.status, msg: text.slice(0, 300) };
+    }
+  } else {
+    payload = { code: response.status, msg: response.statusText || "Empty response" };
+  }
+  return { transportError: false, status: response.status, payload };
+}
+
+function fromApiPayload(payload, onSuccess) {
+  const code = payload && typeof payload.code === "number" ? payload.code : 500;
+  if (code === 200) return onSuccess(payload);
+  return errorResult(code, payload?.msg);
+}
+
+async function toolCreateTask(args) {
+  const model = typeof args.model === "string" ? args.model.trim() : "";
+  if (!model) return errorResult(422, "model is required");
+  if (args.input == null || typeof args.input !== "object" || Array.isArray(args.input)) {
+    return errorResult(422, "input must be an object");
+  }
+  const body = { model, input: args.input };
+  if (typeof args.callBackUrl === "string" && args.callBackUrl.trim()) {
+    body.callBackUrl = args.callBackUrl.trim();
+  }
+  const { payload } = await kieRequest("POST", `${API_BASE}/api/v1/jobs/createTask`, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return fromApiPayload(payload, (p) =>
+    jsonResult({
+      ok: true,
+      taskId: p.data?.taskId ?? null,
+      model,
+    }),
+  );
+}
+
+async function fetchTask(taskId) {
+  const url = `${API_BASE}/api/v1/jobs/recordInfo?taskId=${encodeURIComponent(taskId)}`;
+  return kieRequest("GET", url);
+}
+
+async function toolGetTask(args) {
+  const taskId = typeof args.taskId === "string" ? args.taskId.trim() : "";
+  if (!taskId) return errorResult(422, "taskId is required");
+  const { payload } = await fetchTask(taskId);
+  return fromApiPayload(payload, (p) => jsonResult({ ok: true, task: normalizeTask(p.data ?? {}) }));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function toolWaitTask(args) {
+  const taskId = typeof args.taskId === "string" ? args.taskId.trim() : "";
+  if (!taskId) return errorResult(422, "taskId is required");
+  const timeoutSec = Number(args.timeoutSec ?? 600);
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) {
+    return errorResult(422, "timeoutSec must be a positive number");
+  }
+
+  const deadline = Date.now() + timeoutSec * 1000;
+  let delayMs = 2000;
+  let lastTask = null;
+
+  while (true) {
+    const { payload } = await fetchTask(taskId);
+    const code = payload && typeof payload.code === "number" ? payload.code : 500;
+    if (code !== 200) return errorResult(code, payload?.msg, lastTask ? { lastTask } : {});
+
+    lastTask = normalizeTask(payload.data ?? {});
+    if (lastTask.state === "success" || lastTask.state === "fail") {
+      return jsonResult({
+        ok: lastTask.state === "success",
+        task: lastTask,
+      }, lastTask.state === "fail");
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return jsonResult(
+        {
+          ok: false,
+          code: 408,
+          error: `Timed out after ${timeoutSec}s while the task was still '${lastTask.state ?? "unknown"}'. Poll again with kie_wait_task or kie_get_task.`,
+          task: lastTask,
+        },
+        true,
+      );
+    }
+    await sleep(Math.min(delayMs, remaining));
+    delayMs = Math.min(5000, Math.round(delayMs * 1.5));
+  }
+}
+
+async function toolGetCredits() {
+  const { payload } = await kieRequest("GET", `${API_BASE}/api/v1/chat/credit`);
+  return fromApiPayload(payload, (p) =>
+    jsonResult({
+      ok: true,
+      credits: p.data,
+      msg: p.msg ?? "success",
+    }),
+  );
+}
+
+function encodeMultipart(fields, fileField) {
+  const boundary = `----KieUpload${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+  const chunks = [];
+  const encoder = new TextEncoder();
+  for (const [name, value] of fields) {
+    if (value == null || value === "") continue;
+    chunks.push(
+      encoder.encode(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+      ),
+    );
+  }
+  if (fileField) {
+    const header = `--${boundary}\r\nContent-Disposition: form-data; name="${fileField.name}"; filename="${fileField.fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+    chunks.push(encoder.encode(header), fileField.bytes, encoder.encode("\r\n"));
+  }
+  chunks.push(encoder.encode(`--${boundary}--\r\n`));
+  return { body: Buffer.concat(chunks), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+async function toolUploadFile(args) {
+  const sources = [args.path, args.fileUrl, args.base64Data].filter(
+    (v) => typeof v === "string" && v.trim(),
+  );
+  if (sources.length === 0) {
+    return errorResult(422, "Provide one of path, fileUrl, or base64Data");
+  }
+  if (sources.length > 1) {
+    return errorResult(422, "Provide only one of path, fileUrl, or base64Data");
+  }
+  const uploadPath =
+    typeof args.uploadPath === "string" && args.uploadPath.trim()
+      ? args.uploadPath.trim().replace(/^\/+|\/+$/g, "")
+      : "images";
+  if (!uploadPath) return errorResult(422, "uploadPath must not be empty");
+  const fileName = typeof args.fileName === "string" && args.fileName.trim() ? args.fileName.trim() : undefined;
+
+  let url;
+  let headers = {};
+  let body;
+
+  if (typeof args.path === "string" && args.path.trim()) {
+    const filePath = args.path.trim();
+    let bytes;
+    try {
+      bytes = await readFile(filePath);
+    } catch (err) {
+      return errorResult(422, `Cannot read file: ${err instanceof Error ? err.message : "read failed"}`);
+    }
+    const encoded = encodeMultipart(
+      [
+        ["uploadPath", uploadPath],
+        ["fileName", fileName],
+      ],
+      { name: "file", fileName: fileName || basename(filePath), bytes },
+    );
+    url = `${UPLOAD_BASE}/api/file-stream-upload`;
+    headers = { "Content-Type": encoded.contentType };
+    body = encoded.body;
+  } else if (typeof args.fileUrl === "string" && args.fileUrl.trim()) {
+    url = `${UPLOAD_BASE}/api/file-url-upload`;
+    headers = { "Content-Type": "application/json" };
+    body = JSON.stringify({
+      fileUrl: args.fileUrl.trim(),
+      uploadPath,
+      ...(fileName ? { fileName } : {}),
+    });
+  } else {
+    url = `${UPLOAD_BASE}/api/file-base64-upload`;
+    headers = { "Content-Type": "application/json" };
+    body = JSON.stringify({
+      base64Data: String(args.base64Data).trim(),
+      uploadPath,
+      ...(fileName ? { fileName } : {}),
+    });
+  }
+
+  const { payload } = await kieRequest("POST", url, { headers, body });
+  const code = payload && typeof payload.code === "number" ? payload.code : 500;
+  if (code !== 200) return errorResult(code, payload?.msg);
+  const data = payload.data ?? {};
+  return jsonResult({
+    ok: true,
+    downloadUrl: data.downloadUrl ?? null,
+    fileName: data.fileName ?? null,
+    filePath: data.filePath ?? null,
+    fileSize: data.fileSize ?? null,
+    mimeType: data.mimeType ?? null,
+    uploadedAt: data.uploadedAt ?? null,
+    note: "Uploaded files are deleted after 24 hours. Use downloadUrl promptly as a public input URL.",
+  });
+}
+
+async function callTool(name, rawArgs) {
+  const args = rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs) ? rawArgs : {};
+  switch (name) {
+    case "kie_create_task":
+      return toolCreateTask(args);
+    case "kie_get_task":
+      return toolGetTask(args);
+    case "kie_wait_task":
+      return toolWaitTask(args);
+    case "kie_get_credits":
+      return toolGetCredits();
+    case "kie_upload_file":
+      return toolUploadFile(args);
+    default:
+      return null;
+  }
+}
+
+function writeMessage(message) {
+  const json = JSON.stringify(message);
+  const payload = Buffer.from(json, "utf8");
+  const header = Buffer.from(`Content-Length: ${payload.length}\r\n\r\n`, "utf8");
+  process.stdout.write(Buffer.concat([header, payload]));
+}
+
+function sendResult(id, result) {
+  writeMessage({ jsonrpc: "2.0", id, result });
+}
+
+function sendError(id, code, message, data) {
+  const error = { code, message };
+  if (data !== undefined) error.data = data;
+  writeMessage({ jsonrpc: "2.0", id, error });
+}
+
+async function handleMessage(message) {
+  if (!message || message.jsonrpc !== "2.0") return;
+  const { id, method, params } = message;
+  const isNotification = id === undefined;
+
+  if (method === "notifications/initialized" || method === "initialized") {
+    return;
+  }
+
+  if (isNotification) return;
+
+  try {
+    if (method === "initialize") {
+      sendResult(id, {
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: { tools: {} },
+        serverInfo: SERVER_INFO,
+      });
+      return;
+    }
+    if (method === "ping") {
+      sendResult(id, {});
+      return;
+    }
+    if (method === "tools/list") {
+      sendResult(id, { tools: TOOLS });
+      return;
+    }
+    if (method === "tools/call") {
+      const toolName = params?.name;
+      if (typeof toolName !== "string" || !toolName) {
+        sendError(id, -32602, "tools/call requires params.name");
+        return;
+      }
+      const result = await callTool(toolName, params?.arguments ?? {});
+      if (!result) {
+        sendError(id, -32601, `Unknown tool: ${toolName}`);
+        return;
+      }
+      sendResult(id, result);
+      return;
+    }
+    sendError(id, -32601, `Method not found: ${method}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Internal error";
+    sendError(id, -32603, msg);
+  }
+}
+
+function startStdio() {
+  process.stdin.on("error", (err) => {
+    process.stderr.write(`stdin error: ${err instanceof Error ? err.message : String(err)}\n`);
+  });
+
+  let buffer = Buffer.alloc(0);
+  process.stdin.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (true) {
+      const headerEnd = buffer.indexOf("\r\n\r\n");
+      if (headerEnd === -1) break;
+      const header = buffer.subarray(0, headerEnd).toString("utf8");
+      const match = header.match(/content-length:\s*(\d+)/i);
+      if (!match) {
+        process.stderr.write("Malformed MCP header: missing Content-Length\n");
+        buffer = buffer.subarray(headerEnd + 4);
+        continue;
+      }
+      const length = Number(match[1]);
+      const start = headerEnd + 4;
+      if (buffer.length < start + length) break;
+      const body = buffer.subarray(start, start + length).toString("utf8");
+      buffer = buffer.subarray(start + length);
+      let parsed;
+      try {
+        parsed = JSON.parse(body);
+      } catch (err) {
+        process.stderr.write(`Invalid JSON-RPC body: ${err instanceof Error ? err.message : String(err)}\n`);
+        continue;
+      }
+      void handleMessage(parsed);
+    }
+  });
+
+  process.stdin.on("end", () => {
+    process.exit(0);
+  });
+}
+
+startStdio();

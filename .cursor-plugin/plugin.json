@@ -1,0 +1,21 @@
+{
+  "name": "kie-ai",
+  "version": "0.1.0",
+  "description": "Generate and poll images, video, and music through the kie.ai Market task API.",
+  "author": {
+    "name": "xiao yong"
+  },
+  "keywords": ["kie.ai", "image", "video", "music", "generation", "mcp"],
+  "homepage": "https://docs.kie.ai/cn/market/quickstart",
+  "variables": {
+    "type": "object",
+    "properties": {
+      "KIE_API_KEY": {
+        "type": "string",
+        "title": "kie.ai API key",
+        "description": "Secret Bearer API key from https://kie.ai/api-key. Used only as ${KIE_API_KEY} in mcp.json; never store the real value in the plugin."
+      }
+    },
+    "required": ["KIE_API_KEY"]
+  }
+}

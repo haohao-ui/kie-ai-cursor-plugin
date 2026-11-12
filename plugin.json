@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "kie-ai",
+  "version": "0.1.0",
+  "description": "Generate and poll images, video, and music through the kie.ai Market task API.",
+  "author": {
+    "name": "xiao yong"
+  },
+  "keywords": ["kie.ai", "image", "video", "music", "generation", "mcp"],
+  "homepage": "https://docs.kie.ai/cn/market/quickstart"
+}
