@@ -1,0 +1,1 @@
+# kie-ai-cursor-plugin
