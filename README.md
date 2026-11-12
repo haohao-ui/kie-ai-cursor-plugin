@@ -1,3 +1,5 @@
+<img src="assets/logo.png" width="128" alt="kie.ai logo">
+
 # kie-ai
 
 Cursor / Agent Plugin that wraps the [kie.ai](https://docs.kie.ai/cn/market/quickstart) Market API for images, video, and music.
