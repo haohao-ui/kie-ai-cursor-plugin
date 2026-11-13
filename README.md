@@ -29,13 +29,13 @@ The stdio server is zero-dependency Node.js >= 18 (`server/index.mjs`).
 Manual run:
 
 ```bash
-KIE_API_KEY=your-key node ./server/index.mjs
+KIE_API_KEY=your-key node "${CURSOR_PLUGIN_ROOT}/server/index.mjs"
 ```
 
 ## Notes
 
 - Official Agent Plugins `plugin.json` cannot declare user secrets (closed schema). This repo keeps a valid root `plugin.json`, and puts the `KIE_API_KEY` variable in `.cursor-plugin/plugin.json` for Cursor.
-- Cursor expands `${CURSOR_PLUGIN_ROOT}` in `mcp.json`, not `${PLUGIN_ROOT}`. This plugin omits `cwd` (clients default to the plugin root) and uses the relative arg `./server/index.mjs`.
+- Cursor expands `${CURSOR_PLUGIN_ROOT}` in `mcp.json` `command`, `args`, `env`, and `cwd`, not `${PLUGIN_ROOT}`. The server arg is `${CURSOR_PLUGIN_ROOT}/server/index.mjs`. `cwd` is omitted: the Agent Plugins schema only allows `./`, `${PLUGIN_ROOT}`, or `${PLUGIN_DATA}` there.
 - Current Veo 3.1 and Suno generate/extend docs use `POST /api/v1/jobs/createTask`. This plugin does not wrap the legacy dedicated endpoints.
 - Always get an explicit OK from the user before starting video generation. Creates spend credits.
 

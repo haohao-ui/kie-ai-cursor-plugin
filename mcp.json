@@ -4,7 +4,7 @@
     "kie-ai": {
       "type": "stdio",
       "command": "node",
-      "args": ["./server/index.mjs"],
+      "args": ["${CURSOR_PLUGIN_ROOT}/server/index.mjs"],
       "env": {
         "KIE_API_KEY": "${KIE_API_KEY}"
       }
