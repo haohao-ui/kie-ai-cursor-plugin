@@ -1,0 +1,17 @@
+{
+  "name": "kie-ai-plugins",
+  "owner": {
+    "name": "kie.ai",
+    "email": "saengsuwan-8628@agentmail.to"
+  },
+  "metadata": {
+    "description": "kie.ai image, video, and music generation for Cursor"
+  },
+  "plugins": [
+    {
+      "name": "kie-ai",
+      "source": "./",
+      "description": "Generate and poll images, video, and music through the kie.ai Market task API."
+    }
+  ]
+}
