@@ -483,10 +483,8 @@ async function callTool(name, rawArgs) {
 }
 
 function writeMessage(message) {
-  const json = JSON.stringify(message);
-  const payload = Buffer.from(json, "utf8");
-  const header = Buffer.from(`Content-Length: ${payload.length}\r\n\r\n`, "utf8");
-  process.stdout.write(Buffer.concat([header, payload]));
+  // MCP stdio transport: newline-delimited JSON-RPC messages.
+  process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
 function sendResult(id, result) {
@@ -553,37 +551,39 @@ function startStdio() {
     process.stderr.write(`stdin error: ${err instanceof Error ? err.message : String(err)}\n`);
   });
 
-  let buffer = Buffer.alloc(0);
+  let pending = 0;
+  let ended = false;
+  const maybeExit = () => {
+    if (ended && pending === 0) process.exit(0);
+  };
+
+  let buffer = "";
+  process.stdin.setEncoding("utf8");
   process.stdin.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    while (true) {
-      const headerEnd = buffer.indexOf("\r\n\r\n");
-      if (headerEnd === -1) break;
-      const header = buffer.subarray(0, headerEnd).toString("utf8");
-      const match = header.match(/content-length:\s*(\d+)/i);
-      if (!match) {
-        process.stderr.write("Malformed MCP header: missing Content-Length\n");
-        buffer = buffer.subarray(headerEnd + 4);
-        continue;
-      }
-      const length = Number(match[1]);
-      const start = headerEnd + 4;
-      if (buffer.length < start + length) break;
-      const body = buffer.subarray(start, start + length).toString("utf8");
-      buffer = buffer.subarray(start + length);
+    buffer += chunk;
+    let newline;
+    while ((newline = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, newline).replace(/\r$/, "").trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
       let parsed;
       try {
-        parsed = JSON.parse(body);
+        parsed = JSON.parse(line);
       } catch (err) {
-        process.stderr.write(`Invalid JSON-RPC body: ${err instanceof Error ? err.message : String(err)}\n`);
+        process.stderr.write(`Invalid JSON-RPC message: ${err instanceof Error ? err.message : String(err)}\n`);
         continue;
       }
-      void handleMessage(parsed);
+      pending += 1;
+      handleMessage(parsed).finally(() => {
+        pending -= 1;
+        maybeExit();
+      });
     }
   });
 
   process.stdin.on("end", () => {
-    process.exit(0);
+    ended = true;
+    maybeExit();
   });
 }
 
